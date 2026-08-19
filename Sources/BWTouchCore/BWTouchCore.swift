@@ -3,28 +3,30 @@ import Foundation
 import LocalAuthentication
 import Security
 
-private let service = "bitwarden.cli-master-password"
-private let account = "user@example.com"
-private let bwPath = "/opt/homebrew/bin/bw"
-private let ttl: TimeInterval = 15 * 60
-private let socketPath = FileManager.default.temporaryDirectory
+let service = "bitwarden.cli-master-password"
+let account = "user@example.com"
+let bwPath = "/opt/homebrew/bin/bw"
+let ttl: TimeInterval = 15 * 60
+let socketPath = FileManager.default.temporaryDirectory
     .appendingPathComponent("bw-touch-\(getuid()).sock").path
 
-private struct Request: Codable {
+struct Request: Codable {
     let arguments: [String]
 }
 
-private struct Response: Codable {
+struct Response: Codable {
     let status: Int32
     let stdout: String
     let stderr: String
 }
 
-private struct VaultStatus: Codable {
+struct VaultStatus: Codable {
     let status: String
 }
 
-private enum ToolError: Error, CustomStringConvertible {
+typealias ProcessRunner = (_ arguments: [String], _ extraEnvironment: [String: String]) throws -> Response
+
+enum ToolError: Error, CustomStringConvertible {
     case message(String)
 
     var description: String {
@@ -34,7 +36,7 @@ private enum ToolError: Error, CustomStringConvertible {
     }
 }
 
-private func secureRead(_ prompt: String) throws -> Data {
+func secureRead(_ prompt: String) throws -> Data {
     FileHandle.standardError.write(Data(prompt.utf8))
     var original = termios()
     guard tcgetattr(STDIN_FILENO, &original) == 0 else {
@@ -56,7 +58,7 @@ private func secureRead(_ prompt: String) throws -> Data {
     return Data(line.utf8)
 }
 
-private func keychainBaseQuery() -> [String: Any] {
+func keychainBaseQuery() -> [String: Any] {
     [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
@@ -64,14 +66,18 @@ private func keychainBaseQuery() -> [String: Any] {
     ]
 }
 
-private func executablePath() throws -> String {
-    guard let executableURL = Bundle.main.executableURL else {
+func resolvedExecutablePath(_ executableURL: URL?) throws -> String {
+    guard let executableURL else {
         throw ToolError.message("Unable to resolve the bw-touch executable")
     }
     return executableURL.resolvingSymlinksInPath().path
 }
 
-private func trustedApplicationAccess(label: String) throws -> SecAccess {
+func executablePath() throws -> String {
+    try resolvedExecutablePath(Bundle.main.executableURL)
+}
+
+func trustedApplicationAccess(label: String) throws -> SecAccess {
     let executablePath = try executablePath()
     var trustedApplication: SecTrustedApplication?
     let trustedStatus = SecTrustedApplicationCreateFromPath(executablePath, &trustedApplication)
@@ -86,7 +92,7 @@ private func trustedApplicationAccess(label: String) throws -> SecAccess {
     return access
 }
 
-private func authenticateWithTouchID() throws {
+func authenticateWithTouchID() throws {
     let context = LAContext()
     context.localizedReason = "Unlock Bitwarden CLI for 15 minutes"
     var capabilityError: NSError?
@@ -109,7 +115,7 @@ private func authenticateWithTouchID() throws {
     }
 }
 
-private func setupCredential() throws {
+func setupCredential() throws {
     var existing = keychainBaseQuery()
     existing[kSecReturnAttributes as String] = true
     var result: CFTypeRef?
@@ -139,9 +145,10 @@ private func setupCredential() throws {
     FileHandle.standardOutput.write(Data("Touch ID credential stored.\n".utf8))
 }
 
-private func selfTestKeychain() throws {
-    let testService = "bitwarden.cli-keychain-self-test"
-    let testAccount = "bw-touch"
+func selfTestKeychain(
+    service testService: String = "bitwarden.cli-keychain-self-test",
+    account testAccount: String = "bw-touch"
+) throws {
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: testService,
@@ -178,7 +185,7 @@ private func selfTestKeychain() throws {
     FileHandle.standardOutput.write(Data("Keychain ACL self-test passed.\n".utf8))
 }
 
-private func readCredential() throws -> String {
+func readCredential() throws -> String {
     try authenticateWithTouchID()
     var query = keychainBaseQuery()
     query[kSecReturnData as String] = true
@@ -192,9 +199,13 @@ private func readCredential() throws -> String {
     return value
 }
 
-private func runProcess(arguments: [String], extraEnvironment: [String: String] = [:]) throws -> Response {
+func runProcess(
+    executablePath: String = bwPath,
+    arguments: [String],
+    extraEnvironment: [String: String] = [:]
+) throws -> Response {
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: bwPath)
+    process.executableURL = URL(fileURLWithPath: executablePath)
     process.arguments = arguments
     var environment = ProcessInfo.processInfo.environment
     for (key, value) in extraEnvironment { environment[key] = value }
@@ -229,7 +240,7 @@ private func runProcess(arguments: [String], extraEnvironment: [String: String] 
     )
 }
 
-private func sessionFromResponse(_ response: Response, action: String) throws -> String {
+func sessionFromResponse(_ response: Response, action: String) throws -> String {
     guard response.status == 0 else {
         throw ToolError.message(response.stderr.isEmpty ? "Bitwarden \(action) failed" : response.stderr)
     }
@@ -238,10 +249,13 @@ private func sessionFromResponse(_ response: Response, action: String) throws ->
     return session
 }
 
-private func createSession() throws -> String {
-    let password = try readCredential()
+func createSession(
+    credentialReader: () throws -> String = readCredential,
+    processRunner: ProcessRunner = { try runProcess(arguments: $0, extraEnvironment: $1) }
+) throws -> String {
+    let password = try credentialReader()
     let environment = ["BW_TOUCH_MASTER": password]
-    let statusResponse = try runProcess(arguments: ["status"])
+    let statusResponse = try processRunner(["status"], [:])
     guard statusResponse.status == 0,
           let statusData = statusResponse.stdout.data(using: .utf8),
           let vaultStatus = try? JSONDecoder().decode(VaultStatus.self, from: statusData) else {
@@ -249,28 +263,28 @@ private func createSession() throws -> String {
     }
 
     if vaultStatus.status == "unauthenticated" {
-        let response = try runProcess(
-            arguments: ["login", account, "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-            extraEnvironment: environment
+        let response = try processRunner(
+            ["login", account, "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
+            environment
         )
         return try sessionFromResponse(response, action: "login")
     }
 
-    let response = try runProcess(
-        arguments: ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-        extraEnvironment: environment
+    let response = try processRunner(
+        ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
+        environment
     )
     return try sessionFromResponse(response, action: "unlock")
 }
 
-private func makeAddress() throws -> sockaddr_un {
+func makeAddress(path: String = socketPath) throws -> sockaddr_un {
     var address = sockaddr_un()
     address.sun_family = sa_family_t(AF_UNIX)
     address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    let bytes = Array(socketPath.utf8CString)
+    let bytes = Array(path.utf8CString)
     let capacity = MemoryLayout.size(ofValue: address.sun_path)
     guard bytes.count <= capacity else { throw ToolError.message("Socket path is too long") }
-    _ = socketPath.withCString { source in
+    _ = path.withCString { source in
         withUnsafeMutablePointer(to: &address.sun_path) { pathPointer in
             pathPointer.withMemoryRebound(to: CChar.self, capacity: capacity) { destination in
                 strlcpy(destination, source, capacity)
@@ -280,7 +294,7 @@ private func makeAddress() throws -> sockaddr_un {
     return address
 }
 
-private func withSocketAddress<T>(_ address: inout sockaddr_un, _ body: (UnsafePointer<sockaddr>, socklen_t) -> T) -> T {
+func withSocketAddress<T>(_ address: inout sockaddr_un, _ body: (UnsafePointer<sockaddr>, socklen_t) -> T) -> T {
     withUnsafePointer(to: &address) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
             body($0, socklen_t(MemoryLayout<sockaddr_un>.size))
@@ -288,7 +302,7 @@ private func withSocketAddress<T>(_ address: inout sockaddr_un, _ body: (UnsafeP
     }
 }
 
-private func writeAll(_ fd: Int32, data: Data) throws {
+func writeAll(_ fd: Int32, data: Data) throws {
     try data.withUnsafeBytes { rawBuffer in
         guard let base = rawBuffer.baseAddress else { return }
         var sent = 0
@@ -300,7 +314,7 @@ private func writeAll(_ fd: Int32, data: Data) throws {
     }
 }
 
-private func readAll(_ fd: Int32) throws -> Data {
+func readAll(_ fd: Int32) throws -> Data {
     var data = Data()
     var buffer = [UInt8](repeating: 0, count: 8192)
     while true {
@@ -312,10 +326,10 @@ private func readAll(_ fd: Int32) throws -> Data {
     return data
 }
 
-private func connectSocket() throws -> Int32 {
+func connectSocket(path: String = socketPath) throws -> Int32 {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { throw ToolError.message("Unable to create client socket") }
-    var address = try makeAddress()
+    var address = try makeAddress(path: path)
     let status = withSocketAddress(&address) { Darwin.connect(fd, $0, $1) }
     if status != 0 {
         close(fd)
@@ -324,7 +338,7 @@ private func connectSocket() throws -> Int32 {
     return fd
 }
 
-private func spawnAgent() throws {
+func spawnAgent() throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: try executablePath())
     process.arguments = ["--daemon"]
@@ -334,14 +348,18 @@ private func spawnAgent() throws {
     try process.run()
 }
 
-private func sendRequest(_ arguments: [String]) throws -> Response {
+func sendRequest(
+    _ arguments: [String],
+    path: String = socketPath,
+    spawn: () throws -> Void = spawnAgent
+) throws -> Response {
     var fd: Int32 = -1
     for attempt in 0..<30 {
-        if let connected = try? connectSocket() {
+        if let connected = try? connectSocket(path: path) {
             fd = connected
             break
         }
-        if attempt == 0 { try spawnAgent() }
+        if attempt == 0 { try spawn() }
         usleep(100_000)
     }
     guard fd >= 0 else { throw ToolError.message("Unable to start bw-touch agent") }
@@ -352,26 +370,31 @@ private func sendRequest(_ arguments: [String]) throws -> Response {
     return try JSONDecoder().decode(Response.self, from: readAll(fd))
 }
 
-private func runDaemon() throws {
-    unlink(socketPath)
+func runDaemon(
+    path: String = socketPath,
+    timeout: TimeInterval = ttl,
+    sessionFactory: () throws -> String = { try createSession() },
+    processRunner: ProcessRunner = { try runProcess(arguments: $0, extraEnvironment: $1) }
+) throws {
+    unlink(path)
     let server = socket(AF_UNIX, SOCK_STREAM, 0)
     guard server >= 0 else { throw ToolError.message("Unable to create agent socket") }
     defer {
         close(server)
-        unlink(socketPath)
+        unlink(path)
     }
-    var address = try makeAddress()
+    var address = try makeAddress(path: path)
     guard withSocketAddress(&address, { Darwin.bind(server, $0, $1) }) == 0 else {
         throw ToolError.message("Unable to bind agent socket")
     }
-    chmod(socketPath, S_IRUSR | S_IWUSR)
+    chmod(path, S_IRUSR | S_IWUSR)
     guard listen(server, 8) == 0 else { throw ToolError.message("Unable to listen on agent socket") }
 
     var session: String?
     var lastUsed = Date()
     var shouldExit = false
     while !shouldExit {
-        let remaining = max(0, ttl - Date().timeIntervalSince(lastUsed))
+        let remaining = max(0, timeout - Date().timeIntervalSince(lastUsed))
         var descriptor = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
         let pollStatus = poll(&descriptor, 1, Int32(remaining * 1000))
         if pollStatus == 0 { break }
@@ -384,13 +407,13 @@ private func runDaemon() throws {
         do {
             let request = try JSONDecoder().decode(Request.self, from: readAll(client))
             if request.arguments == ["lock"] {
-                let response = try runProcess(arguments: ["lock"])
+                let response = try processRunner(["lock"], [:])
                 try writeAll(client, data: try JSONEncoder().encode(response))
                 session = nil
                 shouldExit = true
             } else {
-                if session == nil { session = try createSession() }
-                let response = try runProcess(arguments: request.arguments, extraEnvironment: ["BW_SESSION": session!])
+                if session == nil { session = try sessionFactory() }
+                let response = try processRunner(request.arguments, ["BW_SESSION": session!])
                 try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
             }
@@ -400,12 +423,11 @@ private func runDaemon() throws {
         }
         close(client)
     }
-    if session != nil { _ = try? runProcess(arguments: ["lock"]) }
+    if session != nil { _ = try? processRunner(["lock"], [:]) }
 }
 
-private func main() -> Int32 {
+public func runCLI(arguments: [String]) -> Int32 {
     do {
-        let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments == ["setup"] {
             try setupCredential()
             return 0
@@ -431,5 +453,3 @@ private func main() -> Int32 {
         return 1
     }
 }
-
-exit(main())
