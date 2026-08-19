@@ -4,136 +4,182 @@ import Security
 import XCTest
 @testable import BWTouchCore
 
-final class SessionTests: XCTestCase {
-    func testSessionResponseTrimsWhitespace() throws {
-        let response = Response(status: 0, stdout: "  session-token\n", stderr: "")
-        XCTAssertEqual(try sessionFromResponse(response, action: "unlock"), "session-token")
+final class CommandExecutionTests: XCTestCase {
+    func testParsesVaultStatus() throws {
+        let status = try parseVaultStatus(
+            Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
+        )
+        XCTAssertEqual(status.status, "locked")
     }
 
-    func testSessionResponseUsesStderrOnFailure() {
+    func testMalformedStatusPreservesDiagnostic() {
         assertThrowsMessage(
-            try sessionFromResponse(Response(status: 1, stdout: "", stderr: "server rejected\n"), action: "login"),
-            contains: "server rejected"
-        )
-    }
-
-    func testSessionResponseBuildsFallbackFailure() {
-        assertThrowsMessage(
-            try sessionFromResponse(Response(status: 1, stdout: "", stderr: ""), action: "unlock"),
-            contains: "Bitwarden unlock failed"
-        )
-    }
-
-    func testSessionResponseRejectsEmptyToken() {
-        assertThrowsMessage(
-            try sessionFromResponse(Response(status: 0, stdout: " \n", stderr: ""), action: "login"),
-            contains: "empty session"
-        )
-    }
-
-    func testUnauthenticatedStatusLogsIn() throws {
-        var calls: [Invocation] = []
-        let session = try createSession(
-            credentialReader: { "master" },
-            processRunner: { arguments, environment in
-                calls.append(Invocation(arguments: arguments, environment: environment))
-                if arguments == ["status"] {
-                    return Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
-                }
-                return Response(status: 0, stdout: "login-session\n", stderr: "")
-            }
-        )
-
-        XCTAssertEqual(session, "login-session")
-        XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls[0], Invocation(arguments: ["status"], environment: [:]))
-        XCTAssertEqual(
-            calls[1],
-            Invocation(
-                arguments: ["login", account, "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-                environment: ["BW_TOUCH_MASTER": "master"]
-            )
-        )
-    }
-
-    func testLockedStatusUnlocks() throws {
-        var calls: [Invocation] = []
-        let session = try createSession(
-            credentialReader: { "master" },
-            processRunner: { arguments, environment in
-                calls.append(Invocation(arguments: arguments, environment: environment))
-                if arguments == ["status"] {
-                    return Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
-                }
-                return Response(status: 0, stdout: "unlock-session", stderr: "")
-            }
-        )
-
-        XCTAssertEqual(session, "unlock-session")
-        XCTAssertEqual(
-            calls.last,
-            Invocation(
-                arguments: ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-                environment: ["BW_TOUCH_MASTER": "master"]
-            )
-        )
-    }
-
-    func testUnlockedStatusRefreshesSessionByUnlocking() throws {
-        var commands: [[String]] = []
-        _ = try createSession(
-            credentialReader: { "master" },
-            processRunner: { arguments, _ in
-                commands.append(arguments)
-                if arguments == ["status"] {
-                    return Response(status: 0, stdout: #"{"status":"unlocked"}"#, stderr: "")
-                }
-                return Response(status: 0, stdout: "refreshed", stderr: "")
-            }
-        )
-        XCTAssertEqual(commands, [
-            ["status"],
-            ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-        ])
-    }
-
-    func testMalformedStatusFailsBeforeLogin() {
-        var callCount = 0
-        assertThrowsMessage(
-            try createSession(
-                credentialReader: { "master" },
-                processRunner: { _, _ in
-                    callCount += 1
-                    return Response(status: 0, stdout: "not-json", stderr: "")
-                }
-            ),
-            contains: "Unable to read Bitwarden status"
-        )
-        XCTAssertEqual(callCount, 1)
-    }
-
-    func testStatusFailurePreservesDiagnostic() {
-        assertThrowsMessage(
-            try createSession(
-                credentialReader: { "master" },
-                processRunner: { _, _ in Response(status: 2, stdout: "", stderr: "status failed") }
-            ),
+            try parseVaultStatus(Response(status: 2, stdout: "", stderr: "status failed")),
             contains: "status failed"
         )
     }
 
-    func testLoginFailurePreservesDiagnostic() {
-        assertThrowsMessage(
-            try createSession(
-                credentialReader: { "master" },
-                processRunner: { arguments, _ in
-                    arguments == ["status"]
-                        ? Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
-                        : Response(status: 1, stdout: "", stderr: "two-step login required")
+    func testPasswordPromptAndANSISequencesAreRemoved() {
+        let text = "? Master password: [input is hidden] \u{001B}[37D\u{001B}[37C\nreal warning\n"
+        XCTAssertEqual(removingPasswordPrompt(from: text), "real warning")
+    }
+
+    func testOnlyExactLockedResponseTriggersRetry() {
+        XCTAssertTrue(isLockedResponse(Response(status: 1, stdout: "", stderr: "Vault is locked.\n")))
+        XCTAssertFalse(isLockedResponse(Response(status: 1, stdout: "", stderr: "Another vault is locked.")))
+        XCTAssertFalse(isLockedResponse(Response(status: 0, stdout: "", stderr: "Vault is locked.")))
+    }
+
+    func testLockedCommandUnlocksInsideSameProcess() throws {
+        var calls: [Invocation] = []
+        var authorizationCount = 0
+        let response = try executeCommand(
+            ["list", "items"],
+            authorize: { authorizationCount += 1 },
+            credentialReader: { Data("master".utf8) },
+            processRunner: { arguments, environment, input in
+                calls.append(Invocation(arguments: arguments, environment: environment, standardInput: input))
+                if arguments == ["status"] {
+                    return Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
                 }
-            ),
-            contains: "two-step login required"
+                if input == nil {
+                    return Response(status: 1, stdout: "", stderr: "Vault is locked.\n")
+                }
+                return Response(
+                    status: 0,
+                    stdout: "items",
+                    stderr: "? Master password: [input is hidden] \u{001B}[37D\u{001B}[37C"
+                )
+            }
         )
+
+        XCTAssertEqual(response, Response(status: 0, stdout: "items", stderr: ""))
+        XCTAssertEqual(authorizationCount, 1)
+        XCTAssertEqual(calls, [
+            Invocation(
+                arguments: ["list", "items"],
+                environment: ["BW_NOINTERACTION": "true"],
+                standardInput: nil
+            ),
+            Invocation(
+                arguments: ["list", "items"],
+                environment: [:],
+                standardInput: Data("master".utf8)
+            ),
+        ])
+    }
+
+    func testSuccessfulCommandDoesNotReadCredential() throws {
+        var authorizationCount = 0
+        var credentialReadCount = 0
+        let response = try executeCommand(
+            ["generate"],
+            authorize: { authorizationCount += 1 },
+            credentialReader: {
+                credentialReadCount += 1
+                return Data("unused".utf8)
+            },
+            processRunner: { arguments, _, _ in
+                arguments == ["status"]
+                    ? Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
+                    : Response(status: 0, stdout: "generated", stderr: "")
+            }
+        )
+
+        XCTAssertEqual(response.stdout, "generated")
+        XCTAssertEqual(authorizationCount, 0)
+        XCTAssertEqual(credentialReadCount, 0)
+    }
+
+    func testUnauthenticatedAccountLogsInThenRunsCommand() throws {
+        var calls: [Invocation] = []
+        var authorizationCount = 0
+        var credentialReadCount = 0
+        var loggedIn = false
+        let response = try executeCommand(
+            ["get", "item", "example"],
+            authorize: { authorizationCount += 1 },
+            credentialReader: {
+                credentialReadCount += 1
+                return Data("master".utf8)
+            },
+            processRunner: { arguments, environment, input in
+                calls.append(Invocation(arguments: arguments, environment: environment, standardInput: input))
+                switch arguments {
+                case ["status"]:
+                    return Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
+                case ["login", account, "--quiet"]:
+                    loggedIn = true
+                    return Response(status: 0, stdout: "", stderr: "? Master password: [input is hidden]")
+                default:
+                    if !loggedIn {
+                        return Response(status: 1, stdout: "", stderr: "You are not logged in.")
+                    }
+                    if input == nil {
+                        return Response(status: 1, stdout: "", stderr: "Vault is locked.")
+                    }
+                    return Response(status: 0, stdout: "item", stderr: "")
+                }
+            }
+        )
+
+        XCTAssertEqual(response.stdout, "item")
+        XCTAssertEqual(authorizationCount, 2)
+        XCTAssertEqual(credentialReadCount, 2)
+        XCTAssertEqual(calls[2].arguments, ["login", account, "--quiet"])
+        XCTAssertEqual(calls[2].standardInput, Data("master".utf8))
+        XCTAssertEqual(calls.last?.standardInput, Data("master".utf8))
+    }
+
+    func testLoginFailureIsReturnedWithoutRunningTarget() throws {
+        var commands: [[String]] = []
+        let response = try executeCommand(
+            ["list", "items"],
+            authorize: {},
+            credentialReader: { Data("master".utf8) },
+            processRunner: { arguments, _, _ in
+                commands.append(arguments)
+                if arguments == ["status"] {
+                    return Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
+                }
+                return Response(status: 1, stdout: "", stderr: "two-step login required")
+            }
+        )
+
+        XCTAssertEqual(response.status, 1)
+        XCTAssertTrue(response.stderr.contains("two-step"))
+        XCTAssertEqual(commands, [
+            ["list", "items"],
+            ["status"],
+            ["login", account, "--quiet"],
+        ])
+    }
+
+    func testUnrelatedFailureIsNotRetried() throws {
+        var authorizationCount = 0
+        var commandCount = 0
+        let response = try executeCommand(
+            ["get", "item", "missing"],
+            authorize: { authorizationCount += 1 },
+            credentialReader: { Data("master".utf8) },
+            processRunner: { arguments, _, _ in
+                if arguments == ["status"] {
+                    return Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
+                }
+                commandCount += 1
+                return Response(status: 1, stdout: "", stderr: "Not found.")
+            }
+        )
+
+        XCTAssertEqual(response.stderr, "Not found.")
+        XCTAssertEqual(commandCount, 1)
+        XCTAssertEqual(authorizationCount, 0)
+    }
+
+    func testZeroizeClearsCredentialBytes() {
+        var credential = Data("master".utf8)
+        zeroize(&credential)
+        XCTAssertTrue(credential.isEmpty)
     }
 }
 
@@ -170,6 +216,40 @@ final class PathAndSocketTests: XCTestCase {
 
     func testUnixSocketRejectsOverlongPath() {
         assertThrowsMessage(try makeAddress(path: "/tmp/" + String(repeating: "a", count: 200)), contains: "too long")
+    }
+
+    func testProductionSocketPathIsStableAcrossTemporaryDirectories() {
+        XCTAssertTrue(socketPath.hasSuffix("/Library/Caches/bw-touch/agent.sock"))
+        XCTAssertFalse(socketPath.contains(FileManager.default.temporaryDirectory.path + "/bw-touch-"))
+    }
+
+    func testRuntimeDirectoryIsCreatedUserOnly() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bwt-runtime-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try prepareRuntimeDirectory(at: directory)
+
+        var metadata = stat()
+        XCTAssertEqual(lstat(directory.path, &metadata), 0)
+        XCTAssertEqual(metadata.st_uid, getuid())
+        XCTAssertEqual(metadata.st_mode & 0o777, 0o700)
+    }
+
+    func testAgentLaunchUsesGraphicalUserBootstrap() {
+        XCTAssertEqual(
+            agentLaunchArguments(executable: "/usr/local/bin/bw-touch", userID: 42),
+            ["asuser", "42", "/usr/local/bin/bw-touch", "--daemon"]
+        )
+    }
+
+    func testAgentLockRejectsSecondOwner() throws {
+        let path = "/tmp/bwt-lock-\(UUID().uuidString)"
+        defer { unlink(path) }
+        let first = try acquireAgentLock(path: path)
+        defer { close(first) }
+
+        assertThrowsMessage(try acquireAgentLock(path: path), contains: "already running")
     }
 
     func testSocketReadWriteHandlesLargePayload() throws {
@@ -219,6 +299,27 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertNil(ProcessInfo.processInfo.environment["BW_TOUCH_TEST_VALUE"])
     }
 
+    func testProcessRunnerWritesStandardInputWithoutPuttingItInArguments() throws {
+        let input = Data("pipe-only-value".utf8)
+        let response = try runProcess(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "IFS= read -r value; printf %s \"$value\""],
+            standardInput: input
+        )
+
+        XCTAssertEqual(response.status, 0)
+        XCTAssertEqual(response.stdout, "pipe-only-value")
+    }
+
+    func testProcessRunnerClosesUnusedStandardInput() throws {
+        let response = try runProcess(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "if IFS= read -r value; then exit 1; else printf eof; fi"]
+        )
+        XCTAssertEqual(response.status, 0)
+        XCTAssertEqual(response.stdout, "eof")
+    }
+
     func testProcessRunnerDrainsLargeOutputAndErrorConcurrently() throws {
         let response = try runProcess(
             executablePath: "/bin/sh",
@@ -234,29 +335,33 @@ final class ProcessRunnerTests: XCTestCase {
 }
 
 final class DaemonTests: XCTestCase {
-    func testDaemonReusesSessionAndLocksCleanly() throws {
+    func testDaemonReusesAuthorizationAndReadsCredentialPerLockedCommand() throws {
         let path = temporarySocketPath()
-        let recorder = InvocationRecorder()
-        var sessionCount = 0
+        var authorizationCount = 0
+        var credentialReadCount = 0
+        let recorder = lockedVaultRecorder()
         let finished = startDaemon(
             path: path,
             timeout: 5,
-            sessionFactory: {
-                sessionCount += 1
-                return "memory-session"
+            authenticator: { authorizationCount += 1 },
+            credentialReader: {
+                credentialReadCount += 1
+                return Data("master".utf8)
             },
             recorder: recorder
         )
         defer { cleanupDaemon(path: path) }
         waitForSocket(path)
 
-        XCTAssertEqual(try sendRequest(["status"], path: path, spawn: {}).stdout, "status")
         XCTAssertEqual(try sendRequest(["list", "items"], path: path, spawn: {}).stdout, "list items")
-        XCTAssertEqual(sessionCount, 1)
-        let invocations = recorder.snapshot()
-        XCTAssertEqual(invocations.count, 2)
-        XCTAssertEqual(invocations.first?.environment, ["BW_SESSION": "memory-session"])
-        XCTAssertEqual(invocations.last?.environment, ["BW_SESSION": "memory-session"])
+        XCTAssertEqual(try sendRequest(["get", "item", "example"], path: path, spawn: {}).stdout, "get item example")
+        XCTAssertEqual(authorizationCount, 1)
+        XCTAssertEqual(credentialReadCount, 2)
+
+        let credentialInvocations = recorder.snapshot().filter { $0.standardInput != nil }
+        XCTAssertEqual(credentialInvocations.count, 2)
+        XCTAssertTrue(credentialInvocations.allSatisfy { $0.standardInput == Data("master".utf8) })
+        XCTAssertTrue(recorder.snapshot().allSatisfy { $0.environment["BW_SESSION"] == nil })
 
         XCTAssertEqual(try sendRequest(["lock"], path: path, spawn: {}).status, 0)
         wait(for: [finished], timeout: 2)
@@ -267,7 +372,7 @@ final class DaemonTests: XCTestCase {
     func testDaemonSocketIsUserOnly() throws {
         let path = temporarySocketPath()
         let recorder = InvocationRecorder()
-        let finished = startDaemon(path: path, timeout: 5, sessionFactory: { "session" }, recorder: recorder)
+        let finished = startDaemon(path: path, timeout: 5, recorder: recorder)
         defer { cleanupDaemon(path: path) }
         waitForSocket(path)
 
@@ -282,7 +387,7 @@ final class DaemonTests: XCTestCase {
     func testMalformedRequestReturnsErrorAndDaemonContinues() throws {
         let path = temporarySocketPath()
         let recorder = InvocationRecorder()
-        let finished = startDaemon(path: path, timeout: 5, sessionFactory: { "session" }, recorder: recorder)
+        let finished = startDaemon(path: path, timeout: 5, recorder: recorder)
         defer { cleanupDaemon(path: path) }
         waitForSocket(path)
 
@@ -301,28 +406,36 @@ final class DaemonTests: XCTestCase {
 
     func testIdleTimeoutLocksAndRemovesSocket() throws {
         let path = temporarySocketPath()
-        let recorder = InvocationRecorder()
-        let finished = startDaemon(path: path, timeout: 0.15, sessionFactory: { "session" }, recorder: recorder)
+        let recorder = lockedVaultRecorder()
+        let finished = startDaemon(
+            path: path,
+            timeout: 0.15,
+            authenticator: {},
+            credentialReader: { Data("master".utf8) },
+            recorder: recorder
+        )
         defer { cleanupDaemon(path: path) }
         waitForSocket(path)
 
-        _ = try sendRequest(["status"], path: path, spawn: {})
+        _ = try sendRequest(["list", "items"], path: path, spawn: {})
         wait(for: [finished], timeout: 2)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
         XCTAssertEqual(recorder.snapshot().last?.arguments, ["lock"])
     }
 
-    func testLockDoesNotCreateSession() throws {
+    func testLockDoesNotAuthenticateOrReadCredential() throws {
         let path = temporarySocketPath()
         let recorder = InvocationRecorder()
-        var sessionCount = 0
+        var authorizationCount = 0
+        var credentialReadCount = 0
         let finished = startDaemon(
             path: path,
             timeout: 5,
-            sessionFactory: {
-                sessionCount += 1
-                return "session"
+            authenticator: { authorizationCount += 1 },
+            credentialReader: {
+                credentialReadCount += 1
+                return Data("master".utf8)
             },
             recorder: recorder
         )
@@ -331,7 +444,33 @@ final class DaemonTests: XCTestCase {
 
         _ = try sendRequest(["lock"], path: path, spawn: {})
         wait(for: [finished], timeout: 2)
-        XCTAssertEqual(sessionCount, 0)
+        XCTAssertEqual(authorizationCount, 0)
+        XCTAssertEqual(credentialReadCount, 0)
+    }
+
+    func testSecondDaemonCannotReplaceFirstSocket() throws {
+        let path = temporarySocketPath()
+        let recorder = InvocationRecorder()
+        let finished = startDaemon(path: path, timeout: 5, recorder: recorder)
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+
+        assertThrowsMessage(
+            try runDaemon(
+                path: path,
+                lockFilePath: path + ".lock",
+                timeout: 0.1,
+                prepare: {},
+                authenticator: {},
+                credentialReader: { Data("master".utf8) },
+                processRunner: recorder.run
+            ),
+            contains: "already running"
+        )
+
+        XCTAssertEqual(try sendRequest(["status"], path: path, spawn: {}).status, 0)
+        _ = try sendRequest(["lock"], path: path, spawn: {})
+        wait(for: [finished], timeout: 2)
     }
 }
 
@@ -367,17 +506,29 @@ final class KeychainIntegrationTests: XCTestCase {
 private struct Invocation: Equatable {
     let arguments: [String]
     let environment: [String: String]
+    let standardInput: Data?
 }
 
 private final class InvocationRecorder {
+    typealias Handler = ([String], [String: String], Data?) -> Response
+
     private let lock = NSLock()
     private var invocations: [Invocation] = []
+    private let handler: Handler
 
-    func run(arguments: [String], environment: [String: String]) -> Response {
+    init(handler: @escaping Handler = { arguments, _, _ in
+        Response(status: 0, stdout: arguments.joined(separator: " "), stderr: "")
+    }) {
+        self.handler = handler
+    }
+
+    func run(arguments: [String], environment: [String: String], standardInput: Data?) -> Response {
         lock.lock()
-        invocations.append(Invocation(arguments: arguments, environment: environment))
+        invocations.append(
+            Invocation(arguments: arguments, environment: environment, standardInput: standardInput)
+        )
         lock.unlock()
-        return Response(status: 0, stdout: arguments.joined(separator: " "), stderr: "")
+        return handler(arguments, environment, standardInput)
     }
 
     func snapshot() -> [Invocation] {
@@ -417,7 +568,8 @@ private extension XCTestCase {
     func startDaemon(
         path: String,
         timeout: TimeInterval,
-        sessionFactory: @escaping () throws -> String,
+        authenticator: @escaping () throws -> Void = {},
+        credentialReader: @escaping () throws -> Data = { Data("master".utf8) },
         recorder: InvocationRecorder
     ) -> XCTestExpectation {
         let finished = expectation(description: "daemon finished")
@@ -426,8 +578,11 @@ private extension XCTestCase {
             do {
                 try runDaemon(
                     path: path,
+                    lockFilePath: path + ".lock",
                     timeout: timeout,
-                    sessionFactory: sessionFactory,
+                    prepare: {},
+                    authenticator: authenticator,
+                    credentialReader: credentialReader,
                     processRunner: recorder.run
                 )
             } catch {
@@ -442,6 +597,22 @@ private extension XCTestCase {
             _ = try? sendRequest(["lock"], path: path, spawn: {})
         }
         unlink(path)
+        unlink(path + ".lock")
+    }
+}
+
+private func lockedVaultRecorder() -> InvocationRecorder {
+    InvocationRecorder { arguments, environment, standardInput in
+        if arguments == ["status"] {
+            return Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
+        }
+        if arguments == ["lock"] {
+            return Response(status: 0, stdout: "locked", stderr: "")
+        }
+        if environment["BW_NOINTERACTION"] == "true" && standardInput == nil {
+            return Response(status: 1, stdout: "", stderr: "Vault is locked.")
+        }
+        return Response(status: 0, stdout: arguments.joined(separator: " "), stderr: "")
     }
 }
 
