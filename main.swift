@@ -20,6 +20,10 @@ private struct Response: Codable {
     let stderr: String
 }
 
+private struct VaultStatus: Codable {
+    let status: String
+}
+
 private enum ToolError: Error, CustomStringConvertible {
     case message(String)
 
@@ -225,18 +229,38 @@ private func runProcess(arguments: [String], extraEnvironment: [String: String] 
     )
 }
 
-private func unlockSession() throws -> String {
-    let password = try readCredential()
-    let response = try runProcess(
-        arguments: ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
-        extraEnvironment: ["BW_TOUCH_MASTER": password]
-    )
+private func sessionFromResponse(_ response: Response, action: String) throws -> String {
     guard response.status == 0 else {
-        throw ToolError.message(response.stderr.isEmpty ? "Bitwarden unlock failed" : response.stderr)
+        throw ToolError.message(response.stderr.isEmpty ? "Bitwarden \(action) failed" : response.stderr)
     }
     let session = response.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !session.isEmpty else { throw ToolError.message("Bitwarden returned an empty session") }
+    guard !session.isEmpty else { throw ToolError.message("Bitwarden \(action) returned an empty session") }
     return session
+}
+
+private func createSession() throws -> String {
+    let password = try readCredential()
+    let environment = ["BW_TOUCH_MASTER": password]
+    let statusResponse = try runProcess(arguments: ["status"])
+    guard statusResponse.status == 0,
+          let statusData = statusResponse.stdout.data(using: .utf8),
+          let vaultStatus = try? JSONDecoder().decode(VaultStatus.self, from: statusData) else {
+        throw ToolError.message(statusResponse.stderr.isEmpty ? "Unable to read Bitwarden status" : statusResponse.stderr)
+    }
+
+    if vaultStatus.status == "unauthenticated" {
+        let response = try runProcess(
+            arguments: ["login", account, "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
+            extraEnvironment: environment
+        )
+        return try sessionFromResponse(response, action: "login")
+    }
+
+    let response = try runProcess(
+        arguments: ["unlock", "--passwordenv", "BW_TOUCH_MASTER", "--raw"],
+        extraEnvironment: environment
+    )
+    return try sessionFromResponse(response, action: "unlock")
 }
 
 private func makeAddress() throws -> sockaddr_un {
@@ -365,7 +389,7 @@ private func runDaemon() throws {
                 session = nil
                 shouldExit = true
             } else {
-                if session == nil { session = try unlockSession() }
+                if session == nil { session = try createSession() }
                 let response = try runProcess(arguments: request.arguments, extraEnvironment: ["BW_SESSION": session!])
                 try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
