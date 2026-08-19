@@ -60,8 +60,15 @@ private func keychainBaseQuery() -> [String: Any] {
     ]
 }
 
+private func executablePath() throws -> String {
+    guard let executableURL = Bundle.main.executableURL else {
+        throw ToolError.message("Unable to resolve the bw-touch executable")
+    }
+    return executableURL.resolvingSymlinksInPath().path
+}
+
 private func trustedApplicationAccess(label: String) throws -> SecAccess {
-    let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).standardized.path
+    let executablePath = try executablePath()
     var trustedApplication: SecTrustedApplication?
     let trustedStatus = SecTrustedApplicationCreateFromPath(executablePath, &trustedApplication)
     guard trustedStatus == errSecSuccess, let trustedApplication else {
@@ -295,7 +302,7 @@ private func connectSocket() throws -> Int32 {
 
 private func spawnAgent() throws {
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: URL(fileURLWithPath: CommandLine.arguments[0]).standardized.path)
+    process.executableURL = URL(fileURLWithPath: try executablePath())
     process.arguments = ["--daemon"]
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = FileHandle.nullDevice
