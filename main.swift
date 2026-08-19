@@ -57,8 +57,45 @@ private func keychainBaseQuery() -> [String: Any] {
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
         kSecAttrAccount as String: account,
-        kSecUseDataProtectionKeychain as String: true,
     ]
+}
+
+private func trustedApplicationAccess(label: String) throws -> SecAccess {
+    let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).standardized.path
+    var trustedApplication: SecTrustedApplication?
+    let trustedStatus = SecTrustedApplicationCreateFromPath(executablePath, &trustedApplication)
+    guard trustedStatus == errSecSuccess, let trustedApplication else {
+        throw ToolError.message("Unable to bind credential to bw-touch: \(trustedStatus)")
+    }
+    var access: SecAccess?
+    let accessStatus = SecAccessCreate(label as CFString, [trustedApplication] as CFArray, &access)
+    guard accessStatus == errSecSuccess, let access else {
+        throw ToolError.message("Unable to create Keychain access policy: \(accessStatus)")
+    }
+    return access
+}
+
+private func authenticateWithTouchID() throws {
+    let context = LAContext()
+    context.localizedReason = "Unlock Bitwarden CLI for 15 minutes"
+    var capabilityError: NSError?
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &capabilityError) else {
+        throw ToolError.message(capabilityError?.localizedDescription ?? "Touch ID is unavailable")
+    }
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var authenticated = false
+    var authenticationError: Error?
+    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: context.localizedReason) {
+        success, error in
+        authenticated = success
+        authenticationError = error
+        semaphore.signal()
+    }
+    semaphore.wait()
+    guard authenticated else {
+        throw ToolError.message(authenticationError?.localizedDescription ?? "Touch ID authorization failed")
+    }
 }
 
 private func setupCredential() throws {
@@ -79,22 +116,11 @@ private func setupCredential() throws {
         throw ToolError.message("Passwords do not match")
     }
 
-    var accessError: Unmanaged<CFError>?
-    guard let access = SecAccessControlCreateWithFlags(
-        nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        .biometryCurrentSet,
-        &accessError
-    ) else {
-        let detail = accessError?.takeRetainedValue().localizedDescription ?? "unknown error"
-        throw ToolError.message("Unable to create Touch ID policy: \(detail)")
-    }
-
     var item = keychainBaseQuery()
     item[kSecValueData as String] = first
     item[kSecAttrLabel as String] = "Bitwarden CLI master password"
     item[kSecAttrDescription as String] = "Touch ID protected credential for bw-touch"
-    item[kSecAttrAccessControl as String] = access
+    item[kSecAttrAccess as String] = try trustedApplicationAccess(label: "Bitwarden CLI master password")
     let status = SecItemAdd(item as CFDictionary, nil)
     guard status == errSecSuccess else {
         throw ToolError.message("Unable to store credential: \(status)")
@@ -102,13 +128,50 @@ private func setupCredential() throws {
     FileHandle.standardOutput.write(Data("Touch ID credential stored.\n".utf8))
 }
 
+private func selfTestKeychain() throws {
+    let testService = "bitwarden.cli-keychain-self-test"
+    let testAccount = "bw-touch"
+    var query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: testService,
+        kSecAttrAccount as String: testAccount,
+    ]
+    var existing: CFTypeRef?
+    let existingStatus = SecItemCopyMatching(query as CFDictionary, &existing)
+    guard existingStatus == errSecItemNotFound else {
+        throw ToolError.message("Self-test identity already exists: \(existingStatus)")
+    }
+
+    let expected = Data("non-secret-self-test".utf8)
+    query[kSecValueData as String] = expected
+    query[kSecAttrAccess as String] = try trustedApplicationAccess(label: "bw-touch self-test")
+    let addStatus = SecItemAdd(query as CFDictionary, nil)
+    guard addStatus == errSecSuccess else {
+        throw ToolError.message("Self-test add failed: \(addStatus)")
+    }
+    defer {
+        var deleteQuery = query
+        deleteQuery.removeValue(forKey: kSecValueData as String)
+        deleteQuery.removeValue(forKey: kSecAttrAccess as String)
+        SecItemDelete(deleteQuery as CFDictionary)
+    }
+
+    query.removeValue(forKey: kSecValueData as String)
+    query.removeValue(forKey: kSecAttrAccess as String)
+    query[kSecReturnData as String] = true
+    var result: CFTypeRef?
+    let readStatus = SecItemCopyMatching(query as CFDictionary, &result)
+    guard readStatus == errSecSuccess, let actual = result as? Data, actual == expected else {
+        throw ToolError.message("Self-test read failed: \(readStatus)")
+    }
+    FileHandle.standardOutput.write(Data("Keychain ACL self-test passed.\n".utf8))
+}
+
 private func readCredential() throws -> String {
+    try authenticateWithTouchID()
     var query = keychainBaseQuery()
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
-    let context = LAContext()
-    context.localizedReason = "Unlock Bitwarden CLI for 15 minutes"
-    query[kSecUseAuthenticationContext as String] = context
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     guard status == errSecSuccess, let data = result as? Data,
@@ -314,6 +377,10 @@ private func main() -> Int32 {
         let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments == ["setup"] {
             try setupCredential()
+            return 0
+        }
+        if arguments == ["--self-test-keychain"] {
+            try selfTestKeychain()
             return 0
         }
         if arguments == ["--daemon"] {
