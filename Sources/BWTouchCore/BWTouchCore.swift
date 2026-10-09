@@ -14,6 +14,12 @@ let lockPath = runtimeDirectory.appendingPathComponent("agent.lock").path
 
 struct Request: Codable {
     let arguments: [String]
+    let standardInput: Data?
+
+    init(arguments: [String], standardInput: Data? = nil) {
+        self.arguments = arguments
+        self.standardInput = standardInput
+    }
 }
 
 struct Response: Codable, Equatable {
@@ -418,13 +424,16 @@ func writeAll(_ fd: Int32, data: Data) throws {
     }
 }
 
-func readAll(_ fd: Int32) throws -> Data {
+func readAll(_ fd: Int32, maximumBytes: Int? = nil) throws -> Data {
     var data = Data()
     var buffer = [UInt8](repeating: 0, count: 8192)
     while true {
         let count = Darwin.read(fd, &buffer, buffer.count)
         if count == 0 { break }
         guard count > 0 else { throw ToolError.message("Socket read failed") }
+        if let maximumBytes, count > maximumBytes - data.count {
+            throw ToolError.message("Socket request exceeds size limit")
+        }
         data.append(buffer, count: count)
     }
     return data
@@ -458,6 +467,7 @@ func spawnAgent(launcherPath: String = "/bin/launchctl") throws {
 
 func sendRequest(
     _ arguments: [String],
+    standardInput: Data? = nil,
     path: String = socketPath,
     spawn: () throws -> Void = { try spawnAgent() }
 ) throws -> Response {
@@ -473,7 +483,7 @@ func sendRequest(
     guard fd >= 0 else { throw ToolError.message("Unable to start bw-touch agent") }
     defer { close(fd) }
 
-    try writeAll(fd, data: try JSONEncoder().encode(Request(arguments: arguments)))
+    try writeAll(fd, data: try JSONEncoder().encode(Request(arguments: arguments, standardInput: standardInput)))
     shutdown(fd, SHUT_WR)
     return try JSONDecoder().decode(Response.self, from: readAll(fd))
 }
@@ -482,6 +492,9 @@ func runDaemon(
     path: String = socketPath,
     lockFilePath: String = lockPath,
     timeout: TimeInterval = ttl,
+    payloadRunner: (PipedItemOperation, Data) throws -> Response = {
+        try runPipedItemOperation($0, credential: $1)
+    },
     prepare: () throws -> Void = { try prepareRuntimeDirectory() },
     authenticator: () throws -> Void = authenticateWithTouchID,
     credentialReader: () throws -> Data = readCredential,
@@ -539,8 +552,16 @@ func runDaemon(
         let client = accept(server, nil, nil)
         guard client >= 0 else { continue }
         do {
-            let request = try JSONDecoder().decode(Request.self, from: readAll(client))
-            if request.arguments == ["lock"] {
+            let request = try JSONDecoder().decode(Request.self, from: readAll(client, maximumBytes: 8 * 1024 * 1024))
+            if let input = request.standardInput {
+                let operation = try PipedItemOperation(arguments: request.arguments, encodedInput: input)
+                try ensureAuthorized()
+                let response = try withCredential(from: credentialReader) {
+                    try payloadRunner(operation, $0)
+                }
+                try writeAll(client, data: try JSONEncoder().encode(response))
+                lastUsed = Date()
+            } else if request.arguments == ["lock"] {
                 let response = try processRunner(["lock"], [:], nil)
                 try writeAll(client, data: try JSONEncoder().encode(response))
                 authorized = false
@@ -597,7 +618,10 @@ public func runCLI(arguments: [String]) -> Int32 {
             FileHandle.standardError.write(Data("Usage: bw-touch setup | bw-touch <bw arguments>\n".utf8))
             return 2
         }
-        let response = try sendRequest(arguments)
+        let input = try commandInput(arguments: arguments, isTerminal: isatty(STDIN_FILENO) == 1) {
+            FileHandle.standardInput.readData(ofLength: 64 * 1024)
+        }
+        let response = try sendRequest(arguments, standardInput: input)
         FileHandle.standardOutput.write(Data(response.stdout.utf8))
         FileHandle.standardError.write(Data(response.stderr.utf8))
         return response.status
