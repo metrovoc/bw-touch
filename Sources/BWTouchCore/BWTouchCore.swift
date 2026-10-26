@@ -7,6 +7,7 @@ let service = "bitwarden.cli-master-password"
 let account = "user@example.com"
 let bwPath = "/opt/homebrew/bin/bw"
 let ttl: TimeInterval = 15 * 60
+let leaseTTL: TimeInterval = 24 * 60 * 60
 let touchIDTimeout: TimeInterval = 60
 let runtimeDirectory = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Caches/bw-touch", isDirectory: true)
@@ -112,7 +113,7 @@ func trustedApplicationAccess(label: String) throws -> SecAccess {
 
 func authenticateWithTouchID() throws {
     let context = LAContext()
-    context.localizedReason = "Unlock Bitwarden CLI for 15 minutes"
+    context.localizedReason = "Unlock Bitwarden CLI for 15 minutes and keep the items read available for 24 hours"
     var capabilityError: NSError?
     guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &capabilityError) else {
         throw ToolError.message(capabilityError?.localizedDescription ?? "Touch ID is unavailable")
@@ -313,6 +314,13 @@ func isLockedResponse(_ response: Response) -> Bool {
         .trimmingCharacters(in: .whitespacesAndNewlines) == "Vault is locked."
 }
 
+func leaseItemID(for arguments: [String]) -> String? {
+    guard arguments.count == 3, arguments[0] == "get",
+          ["item", "username", "password", "uri", "totp", "notes"].contains(arguments[1]),
+          UUID(uuidString: arguments[2]) != nil else { return nil }
+    return arguments[2].lowercased()
+}
+
 func withCredential<T>(
     from reader: () throws -> Data,
     perform operation: (Data) throws -> T
@@ -497,6 +505,7 @@ func runDaemon(
     path: String = socketPath,
     lockFilePath: String = lockPath,
     timeout: TimeInterval = ttl,
+    leaseDuration: TimeInterval = leaseTTL,
     payloadRunner: (PipedItemOperation, Data) throws -> Response = {
         try runPipedItemOperation($0, credential: $1)
     },
@@ -526,6 +535,8 @@ func runDaemon(
     guard listen(server, 8) == 0 else { throw ToolError.message("Unable to listen on agent socket") }
 
     var authorized = false
+    // Items read by exact ID while authorized stay readable until their lease expires.
+    var leases: [String: Date] = [:]
     var lastUsed = Date()
     var shouldExit = false
 
@@ -534,6 +545,16 @@ func runDaemon(
             try authenticator()
             authorized = true
         }
+    }
+
+    // Compare wall-clock time: poll timeouts do not advance while the Mac sleeps.
+    func expireAuthorization(at now: Date) {
+        guard now >= lastUsed.addingTimeInterval(timeout) else { return }
+        if authorized {
+            _ = try? processRunner(["lock"], [:], nil)
+            authorized = false
+        }
+        leases = leases.filter { $0.value > now }
     }
 
     func runWithCredential(_ arguments: [String]) throws -> Response {
@@ -546,10 +567,13 @@ func runDaemon(
     }
 
     while !shouldExit {
-        let remaining = max(0, timeout - Date().timeIntervalSince(lastUsed))
+        let now = Date()
+        expireAuthorization(at: now)
+        let idleDeadline = lastUsed.addingTimeInterval(timeout)
+        guard let deadline = now < idleDeadline ? idleDeadline : leases.values.max() else { break }
         var descriptor = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
-        let pollStatus = poll(&descriptor, 1, Int32(remaining * 1000))
-        if pollStatus == 0 { break }
+        let pollStatus = poll(&descriptor, 1, Int32(max(0, deadline.timeIntervalSince(now)) * 1000))
+        if pollStatus == 0 { continue }
         if pollStatus < 0 {
             if errno == EINTR { continue }
             throw ToolError.message("Agent poll failed")
@@ -559,6 +583,7 @@ func runDaemon(
         // A client that stops waiting must not end the daemon with SIGPIPE.
         var noSigPipe: Int32 = 1
         setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        expireAuthorization(at: Date())
         do {
             let request = try JSONDecoder().decode(Request.self, from: readAll(client, maximumBytes: 8 * 1024 * 1024))
             if let input = request.standardInput {
@@ -590,12 +615,17 @@ func runDaemon(
                 authorized = false
                 shouldExit = true
             } else {
+                let itemID = leaseItemID(for: request.arguments)
+                let leased = itemID.map { leases[$0, default: .distantPast] > Date() } ?? false
                 let response = try executeCommand(
                     request.arguments,
-                    authorize: ensureAuthorized,
+                    authorize: leased ? {} : ensureAuthorized,
                     credentialReader: credentialReader,
                     processRunner: processRunner
                 )
+                if authorized, response.status == 0, let itemID {
+                    leases[itemID] = Date().addingTimeInterval(leaseDuration)
+                }
                 try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
             }
@@ -605,7 +635,6 @@ func runDaemon(
         }
         close(client)
     }
-    if authorized { _ = try? processRunner(["lock"], [:], nil) }
 }
 
 public func runCLI(arguments: [String]) -> Int32 {

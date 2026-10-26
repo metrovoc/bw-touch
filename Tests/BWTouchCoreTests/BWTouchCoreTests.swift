@@ -30,6 +30,15 @@ final class CommandExecutionTests: XCTestCase {
         XCTAssertFalse(isLockedResponse(Response(status: 0, stdout: "", stderr: "Vault is locked.")))
     }
 
+    func testOnlyExactItemReadsAreLeasable() {
+        XCTAssertEqual(leaseItemID(for: ["get", "item", itemID.uppercased()]), itemID)
+        XCTAssertEqual(leaseItemID(for: ["get", "totp", itemID]), itemID)
+        XCTAssertNil(leaseItemID(for: ["get", "item", "github"]))
+        XCTAssertNil(leaseItemID(for: ["get", "attachment", itemID]))
+        XCTAssertNil(leaseItemID(for: ["get", "item", itemID, "--pretty"]))
+        XCTAssertNil(leaseItemID(for: ["list", "items", "--search", itemID]))
+    }
+
     func testLockedCommandUnlocksInsideSameProcess() throws {
         var calls: [Invocation] = []
         var authorizationCount = 0
@@ -440,6 +449,62 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(recorder.snapshot().last?.arguments, ["lock"])
     }
 
+    func testItemReadInWindowStaysAvailableAfterWindowCloses() throws {
+        let path = temporarySocketPath()
+        var authorizationCount = 0
+        let recorder = lockedVaultRecorder()
+        let finished = startDaemon(
+            path: path,
+            timeout: 0.2,
+            leaseDuration: 5,
+            authenticator: { authorizationCount += 1 },
+            recorder: recorder
+        )
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+
+        let read = ["get", "item", itemID]
+        XCTAssertEqual(try sendRequest(read, path: path, spawn: {}).stdout, read.joined(separator: " "))
+        usleep(400_000)
+        XCTAssertEqual(recorder.snapshot().last?.arguments, ["lock"])
+
+        XCTAssertEqual(try sendRequest(read, path: path, spawn: {}).stdout, read.joined(separator: " "))
+        XCTAssertEqual(try sendRequest(["get", "totp", itemID.uppercased()], path: path, spawn: {}).status, 0)
+        XCTAssertEqual(recorder.snapshot().last?.standardInput, Data("master".utf8))
+        XCTAssertEqual(authorizationCount, 1)
+
+        XCTAssertEqual(try sendRequest(["get", "item", otherItemID], path: path, spawn: {}).status, 0)
+        XCTAssertEqual(authorizationCount, 2)
+
+        _ = try sendRequest(["lock"], path: path, spawn: {})
+        wait(for: [finished], timeout: 2)
+    }
+
+    func testLeaseReadsDoNotExtendLeaseAndDaemonExitsAfterLastLease() throws {
+        let path = temporarySocketPath()
+        var authorizationCount = 0
+        let recorder = lockedVaultRecorder()
+        let start = Date()
+        let finished = startDaemon(
+            path: path,
+            timeout: 0.2,
+            leaseDuration: 1,
+            authenticator: { authorizationCount += 1 },
+            recorder: recorder
+        )
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+
+        XCTAssertEqual(try sendRequest(["get", "item", itemID], path: path, spawn: {}).status, 0)
+        usleep(600_000)
+        XCTAssertEqual(try sendRequest(["get", "item", itemID], path: path, spawn: {}).status, 0)
+
+        wait(for: [finished], timeout: 3)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.4)
+        XCTAssertEqual(authorizationCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
     func testLockDoesNotAuthenticateOrReadCredential() throws {
         let path = temporarySocketPath()
         let recorder = InvocationRecorder()
@@ -519,6 +584,9 @@ final class KeychainIntegrationTests: XCTestCase {
     }
 }
 
+private let itemID = "0f8fad5b-d9cb-469f-a165-70867728950e"
+private let otherItemID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+
 private struct Invocation: Equatable {
     let arguments: [String]
     let environment: [String: String]
@@ -584,6 +652,7 @@ private extension XCTestCase {
     func startDaemon(
         path: String,
         timeout: TimeInterval,
+        leaseDuration: TimeInterval = leaseTTL,
         authenticator: @escaping () throws -> Void = {},
         credentialReader: @escaping () throws -> Data = { Data("master".utf8) },
         recorder: InvocationRecorder
@@ -596,6 +665,7 @@ private extension XCTestCase {
                     path: path,
                     lockFilePath: path + ".lock",
                     timeout: timeout,
+                    leaseDuration: leaseDuration,
                     prepare: {},
                     authenticator: authenticator,
                     credentialReader: credentialReader,
