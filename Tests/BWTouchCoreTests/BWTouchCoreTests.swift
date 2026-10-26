@@ -404,6 +404,22 @@ final class DaemonTests: XCTestCase {
         wait(for: [finished], timeout: 2)
     }
 
+    func testClientThatDisconnectsDoesNotStopDaemon() throws {
+        let path = temporarySocketPath()
+        let recorder = InvocationRecorder()
+        let finished = startDaemon(path: path, timeout: 5, recorder: recorder)
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+
+        let abandoned = try connectSocket(path: path)
+        try writeAll(abandoned, data: JSONEncoder().encode(Request(arguments: ["generate"])))
+        close(abandoned)
+
+        XCTAssertEqual(try sendRequest(["status"], path: path, spawn: {}).status, 0)
+        _ = try sendRequest(["lock"], path: path, spawn: {})
+        wait(for: [finished], timeout: 2)
+    }
+
     func testIdleTimeoutLocksAndRemovesSocket() throws {
         let path = temporarySocketPath()
         let recorder = lockedVaultRecorder()

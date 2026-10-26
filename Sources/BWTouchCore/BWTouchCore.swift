@@ -551,6 +551,9 @@ func runDaemon(
         }
         let client = accept(server, nil, nil)
         guard client >= 0 else { continue }
+        // A client that stops waiting must not end the daemon with SIGPIPE.
+        var noSigPipe: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         do {
             let request = try JSONDecoder().decode(Request.self, from: readAll(client, maximumBytes: 8 * 1024 * 1024))
             if let input = request.standardInput {
