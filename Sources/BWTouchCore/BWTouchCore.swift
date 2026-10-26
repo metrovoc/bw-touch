@@ -7,6 +7,7 @@ let service = "bitwarden.cli-master-password"
 let account = "user@example.com"
 let bwPath = "/opt/homebrew/bin/bw"
 let ttl: TimeInterval = 15 * 60
+let touchIDTimeout: TimeInterval = 60
 let runtimeDirectory = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Caches/bw-touch", isDirectory: true)
 let socketPath = runtimeDirectory.appendingPathComponent("agent.sock").path
@@ -126,7 +127,11 @@ func authenticateWithTouchID() throws {
         authenticationError = error
         semaphore.signal()
     }
-    semaphore.wait()
+    // An unanswered prompt would otherwise stall every request queued behind it.
+    guard semaphore.wait(timeout: .now() + touchIDTimeout) == .success else {
+        context.invalidate()
+        throw ToolError.message("Touch ID prompt timed out")
+    }
     guard authenticated else {
         throw ToolError.message(authenticationError?.localizedDescription ?? "Touch ID authorization failed")
     }
