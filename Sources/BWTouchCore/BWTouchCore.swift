@@ -243,6 +243,11 @@ func runProcess(
     let output = Pipe()
     let errors = Pipe()
     let input = standardInput == nil ? nil : Pipe()
+    if let input {
+        guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw ToolError.message("Unable to configure child input pipe")
+        }
+    }
     process.standardOutput = output
     process.standardError = errors
     process.standardInput = input ?? FileHandle.nullDevice
@@ -453,9 +458,15 @@ func readAll(_ fd: Int32, maximumBytes: Int? = nil) throws -> Data {
 }
 
 func connectSocket(path: String = socketPath) throws -> Int32 {
+    var address = try makeAddress(path: path)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { throw ToolError.message("Unable to create client socket") }
-    var address = try makeAddress(path: path)
+    var noSigPipe: Int32 = 1
+    guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
+                     socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+        close(fd)
+        throw ToolError.message("Unable to configure client socket")
+    }
     let status = withSocketAddress(&address) { Darwin.connect(fd, $0, $1) }
     if status != 0 {
         close(fd)
@@ -501,11 +512,36 @@ func sendRequest(
     return try JSONDecoder().decode(Response.self, from: readAll(fd))
 }
 
+func isSessionEndingCommand(_ arguments: [String]) -> Bool {
+    let flags = ["--pretty", "--raw", "--response", "--cleanexit", "--quiet", "--nointeraction"]
+    var index = 0
+    var foundCommand = false
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--" {
+            return foundCommand ? index == arguments.count - 1
+                : index == arguments.count - 2 && ["lock", "logout"].contains(arguments[index + 1])
+        } else if flags.contains(argument) || argument.hasPrefix("--session=") {
+            index += 1
+        } else if argument == "--session" {
+            guard index + 1 < arguments.count else { return false }
+            index += 2
+        } else if !foundCommand && ["lock", "logout"].contains(argument) {
+            foundCommand = true
+            index += 1
+        } else {
+            return false
+        }
+    }
+    return foundCommand
+}
+
 func runDaemon(
     path: String = socketPath,
     lockFilePath: String = lockPath,
     timeout: TimeInterval = ttl,
     leaseDuration: TimeInterval = leaseTTL,
+    clientTimeout: TimeInterval = 5,
     payloadRunner: (PipedItemOperation, Data) throws -> Response = {
         try runPipedItemOperation($0, credential: $1)
     },
@@ -544,6 +580,7 @@ func runDaemon(
         if !authorized {
             try authenticator()
             authorized = true
+            lastUsed = Date()
         }
     }
 
@@ -580,40 +617,49 @@ func runDaemon(
         }
         let client = accept(server, nil, nil)
         guard client >= 0 else { continue }
-        // A client that stops waiting must not end the daemon with SIGPIPE.
-        var noSigPipe: Int32 = 1
-        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         expireAuthorization(at: Date())
         do {
+            // Bound stalled clients and avoid SIGPIPE if a caller stops waiting.
+            var noSigPipe: Int32 = 1
+            var interval = timeval(
+                tv_sec: Int(clientTimeout),
+                tv_usec: Int32((clientTimeout - floor(clientTimeout)) * 1_000_000)
+            )
+            guard setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
+                             socklen_t(MemoryLayout<Int32>.size)) == 0,
+                  setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &interval,
+                             socklen_t(MemoryLayout<timeval>.size)) == 0,
+                  setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &interval,
+                             socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+                throw ToolError.message("Unable to configure agent client socket")
+            }
             let request = try JSONDecoder().decode(Request.self, from: readAll(client, maximumBytes: 8 * 1024 * 1024))
+            expireAuthorization(at: Date())
             if let input = request.standardInput {
                 let operation = try PipedItemOperation(arguments: request.arguments, encodedInput: input)
                 try ensureAuthorized()
                 let response = try withCredential(from: credentialReader) {
-                    try payloadRunner(operation, $0)
+                    try executePipedItemOperation(operation, credential: $0,
+                                                  processRunner: processRunner, payloadRunner: payloadRunner)
                 }
-                try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
-            } else if request.arguments == ["lock"] {
-                let response = try processRunner(["lock"], [:], nil)
                 try writeAll(client, data: try JSONEncoder().encode(response))
+            } else if isSessionEndingCommand(request.arguments) {
                 authorized = false
+                leases.removeAll()
                 shouldExit = true
-            } else if request.arguments == ["status"] {
                 let response = try processRunner(request.arguments, [:], nil)
                 try writeAll(client, data: try JSONEncoder().encode(response))
+            } else if request.arguments == ["status"] {
+                let response = try processRunner(request.arguments, [:], nil)
                 lastUsed = Date()
+                try writeAll(client, data: try JSONEncoder().encode(response))
             } else if request.arguments.first == "login" || request.arguments.first == "unlock" {
                 var arguments = request.arguments
                 if arguments == ["login"] { arguments.append(account) }
                 let response = try runWithCredential(arguments)
-                try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
-            } else if request.arguments.first == "logout" {
-                let response = try processRunner(request.arguments, [:], nil)
                 try writeAll(client, data: try JSONEncoder().encode(response))
-                authorized = false
-                shouldExit = true
             } else {
                 let itemID = leaseItemID(for: request.arguments)
                 let leased = itemID.map { leases[$0, default: .distantPast] > Date() } ?? false
@@ -626,8 +672,8 @@ func runDaemon(
                 if authorized, response.status == 0, let itemID {
                     leases[itemID] = Date().addingTimeInterval(leaseDuration)
                 }
-                try writeAll(client, data: try JSONEncoder().encode(response))
                 lastUsed = Date()
+                try writeAll(client, data: try JSONEncoder().encode(response))
             }
         } catch {
             let response = Response(status: 1, stdout: "", stderr: "\(error)\n")

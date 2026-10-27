@@ -98,6 +98,81 @@ final class PipedInputTests: XCTestCase {
         }
     }
 
+    func testPipedOperationLogsInBeforeStartingPayloadWhenLoggedOut() throws {
+        let operation = try PipedItemOperation(arguments: ["create", "item"],
+                                               encodedInput: Data(item.base64EncodedString().utf8))
+        let credential = Data("synthetic-master".utf8)
+        var calls: [[String]] = []
+        let expected = Response(status: 0, stdout: "created", stderr: "")
+        let result = try executePipedItemOperation(operation, credential: credential,
+                                                  processRunner: { arguments, environment, input in
+            calls.append(arguments)
+            if arguments == ["status"] {
+                XCTAssertEqual(environment, ["BW_NOINTERACTION": "true"])
+                XCTAssertNil(input)
+                return Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
+            }
+            XCTAssertEqual(arguments, ["login", account, "--quiet"])
+            XCTAssertTrue(environment.isEmpty)
+            XCTAssertEqual(input, credential)
+            return Response(status: 0, stdout: "synthetic-session-must-not-escape", stderr: "")
+        }, payloadRunner: { payload, input in
+            XCTAssertEqual(calls, [["status"], ["login", account, "--quiet"]])
+            calls.append(["payload"])
+            XCTAssertEqual(payload.body, operation.body)
+            XCTAssertEqual(input, credential)
+            return expected
+        })
+        XCTAssertEqual(calls.last, ["payload"])
+        XCTAssertEqual(result, expected)
+    }
+
+    func testPipedOperationReturnsLoginFailureWithoutStartingPayload() throws {
+        let operation = try PipedItemOperation(arguments: ["edit", "item", "01234567-89ab-cdef-0123-456789abcdef"],
+                                               encodedInput: Data(item.base64EncodedString().utf8))
+        var calls: [[String]] = []
+        let result = try executePipedItemOperation(operation, credential: Data("synthetic-master".utf8),
+                                                  processRunner: { arguments, _, _ in
+            calls.append(arguments)
+            if arguments == ["status"] {
+                return Response(status: 0, stdout: #"{"status":"unauthenticated"}"#, stderr: "")
+            }
+            return Response(status: 1, stdout: "", stderr: "Master password:\nLogin failed.\n")
+        }, payloadRunner: { _, _ in
+            XCTFail("A failed login must not start the payload operation")
+            return Response(status: 0, stdout: "unexpected mutation", stderr: "")
+        })
+        XCTAssertEqual(calls, [["status"], ["login", account, "--quiet"]])
+        XCTAssertEqual(result, Response(status: 1, stdout: "", stderr: "Login failed."))
+    }
+
+    func testPipedOperationSkipsLoginWhenAlreadyAuthenticated() throws {
+        let operation = try PipedItemOperation(arguments: ["create", "item"],
+                                               encodedInput: Data(item.base64EncodedString().utf8))
+        let credential = Data("synthetic-master".utf8)
+        let expected = Response(status: 0, stdout: "created", stderr: "")
+        for status in ["locked", "unlocked"] {
+            var statusCalls = 0
+            var payloadCalls = 0
+            let result = try executePipedItemOperation(operation, credential: credential,
+                                                      processRunner: { arguments, environment, input in
+                statusCalls += 1
+                XCTAssertEqual(arguments, ["status"])
+                XCTAssertEqual(environment, ["BW_NOINTERACTION": "true"])
+                XCTAssertNil(input)
+                return Response(status: 0, stdout: "{\"status\":\"\(status)\"}", stderr: "")
+            }, payloadRunner: { payload, input in
+                payloadCalls += 1
+                XCTAssertEqual(payload.body, operation.body)
+                XCTAssertEqual(input, credential)
+                return expected
+            })
+            XCTAssertEqual(statusCalls, 1)
+            XCTAssertEqual(payloadCalls, 1)
+            XCTAssertEqual(result, expected)
+        }
+    }
+
     func testDaemonValidatesBeforeAuthenticationAndKeepsCredentialSeparate() throws {
         let path = "/tmp/bwt-pipe-\(UUID().uuidString.prefix(12)).sock"
         let finished = expectation(description: "daemon exited")
@@ -116,6 +191,9 @@ final class PipedInputTests: XCTestCase {
                 }, prepare: {}, authenticator: { authorized += 1 },
                               credentialReader: { Data("synthetic-master".utf8) },
                               processRunner: { arguments, _, _ in
+                    if arguments == ["status"] {
+                        return Response(status: 0, stdout: #"{"status":"locked"}"#, stderr: "")
+                    }
                     XCTAssertEqual(arguments, ["lock"])
                     return Response(status: 0, stdout: "", stderr: "")
                 })

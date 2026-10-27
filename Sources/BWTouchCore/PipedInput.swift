@@ -192,6 +192,20 @@ func successfulPayloadObject(_ response: PayloadHTTPResponse) throws -> [String:
     return object
 }
 
+func executePipedItemOperation(
+    _ operation: PipedItemOperation,
+    credential: Data,
+    processRunner: ProcessRunner,
+    payloadRunner: (PipedItemOperation, Data) throws -> Response
+) throws -> Response {
+    let status = try parseVaultStatus(processRunner(["status"], ["BW_NOINTERACTION": "true"], nil))
+    if status.status == "unauthenticated" {
+        let login = try processRunner(["login", account, "--quiet"], [:], credential)
+        guard login.status == 0 else { return removingPasswordPrompt(from: login) }
+    }
+    return try payloadRunner(operation, credential)
+}
+
 func stopPayloadProcess(_ process: Process) {
     guard process.isRunning else { return }
     process.terminate()

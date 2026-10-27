@@ -227,6 +227,20 @@ final class PathAndSocketTests: XCTestCase {
         assertThrowsMessage(try makeAddress(path: "/tmp/" + String(repeating: "a", count: 200)), contains: "too long")
     }
 
+    func testRejectedSocketPathDoesNotLeakDescriptor() throws {
+        let available = dup(STDIN_FILENO)
+        XCTAssertGreaterThanOrEqual(available, 0)
+        close(available)
+
+        assertThrowsMessage(
+            try connectSocket(path: "/tmp/" + String(repeating: "a", count: 200)),
+            contains: "too long"
+        )
+
+        XCTAssertEqual(fcntl(available, F_GETFD), -1)
+        XCTAssertEqual(errno, EBADF)
+    }
+
     func testProductionSocketPathIsStableAcrossTemporaryDirectories() {
         XCTAssertTrue(socketPath.hasSuffix("/Library/Caches/bw-touch/agent.sock"))
         XCTAssertFalse(socketPath.contains(FileManager.default.temporaryDirectory.path + "/bw-touch-"))
@@ -283,6 +297,24 @@ final class PathAndSocketTests: XCTestCase {
         shutdown(descriptors[0], SHUT_WR)
         XCTAssertEqual(try readAll(descriptors[1]), Data())
     }
+
+    func testClientSurvivesServerDisconnectingBeforeRequest() throws {
+        let path = temporarySocketPath()
+        let server = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(server, 0)
+        defer { close(server); unlink(path) }
+        var address = try makeAddress(path: path)
+        XCTAssertEqual(withSocketAddress(&address) { Darwin.bind(server, $0, $1) }, 0)
+        XCTAssertEqual(listen(server, 1), 0)
+
+        let client = try connectSocket(path: path)
+        defer { close(client) }
+        let accepted = accept(server, nil, nil)
+        XCTAssertGreaterThanOrEqual(accepted, 0)
+        close(accepted)
+
+        assertThrowsMessage(try writeAll(client, data: Data("request".utf8)), contains: "write failed")
+    }
 }
 
 final class ProcessRunnerTests: XCTestCase {
@@ -329,6 +361,17 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(response.stdout, "eof")
     }
 
+    func testProcessRunnerSurvivesChildClosingStandardInput() throws {
+        let response = try runProcess(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exec 0<&-; printf diagnostic >&2; exit 9"],
+            standardInput: Data(repeating: 0x61, count: 1024 * 1024)
+        )
+
+        XCTAssertEqual(response.status, 9)
+        XCTAssertEqual(response.stderr, "diagnostic")
+    }
+
     func testProcessRunnerDrainsLargeOutputAndErrorConcurrently() throws {
         let response = try runProcess(
             executablePath: "/bin/sh",
@@ -344,6 +387,154 @@ final class ProcessRunnerTests: XCTestCase {
 }
 
 final class DaemonTests: XCTestCase {
+    func testOnlyLockAndLogoutEndAuthorization() {
+        for arguments in [
+            ["lock"], ["logout"], ["--quiet", "lock"], ["--response", "logout"],
+            ["--pretty", "--raw", "--cleanexit", "--nointeraction", "lock", "--quiet"],
+            ["--session", "synthetic-session", "lock"], ["--session=synthetic-session", "logout"],
+            ["--", "lock"], ["lock", "--"], ["--quiet", "--", "logout"],
+        ] {
+            XCTAssertTrue(isSessionEndingCommand(arguments), "Expected session-ending command: \(arguments)")
+        }
+        for arguments in [
+            [], ["get", "item", "lock"], ["--session", "lock"], ["--session=logout"],
+            ["--session"], ["--unknown", "lock"], ["lock", "--unknown"],
+            ["--help", "lock"], ["lock", "--help"], ["logout", "-h"],
+            ["--"], ["--", "--quiet", "lock"], ["lock", "--", "--quiet"],
+        ] {
+            XCTAssertFalse(isSessionEndingCommand(arguments), "Unexpected session-ending command: \(arguments)")
+        }
+    }
+
+    func testDisconnectedLockAndLogoutStillEndAuthorization() throws {
+        for command in [["lock"], ["lock", "--quiet"], ["logout"], ["--quiet", "lock"], ["--response", "logout"]] {
+            let path = temporarySocketPath()
+            let terminationStarted = DispatchSemaphore(value: 0)
+            let allowTermination = DispatchSemaphore(value: 0)
+            var terminationCount = 0
+            let recorder = InvocationRecorder { arguments, environment, input in
+                if arguments == command || arguments == ["lock"] {
+                    terminationCount += 1
+                    if terminationCount == 1 {
+                        terminationStarted.signal()
+                        _ = allowTermination.wait(timeout: .now() + 2)
+                    }
+                    return Response(status: 0, stdout: "", stderr: "")
+                }
+                if environment["BW_NOINTERACTION"] == "true" && input == nil {
+                    return Response(status: 1, stdout: "", stderr: "Vault is locked.")
+                }
+                return Response(status: 0, stdout: "synthetic item", stderr: "")
+            }
+            let finished = startDaemon(path: path, timeout: 5, recorder: recorder)
+            defer { cleanupDaemon(path: path) }
+            waitForSocket(path)
+            _ = try sendRequest(["get", "item", itemID], path: path, spawn: {})
+
+            let client = try connectSocket(path: path)
+            try writeAll(client, data: JSONEncoder().encode(Request(arguments: command)))
+            shutdown(client, SHUT_WR)
+            XCTAssertEqual(terminationStarted.wait(timeout: .now() + 2), .success)
+            close(client)
+            allowTermination.signal()
+
+            wait(for: [finished], timeout: 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+            XCTAssertEqual(recorder.snapshot().last?.arguments, command)
+        }
+    }
+
+    func testStalledClientsDoNotBlockFollowingRequests() throws {
+        for stallsOutput in [false, true] {
+            let path = temporarySocketPath()
+            let recorder = InvocationRecorder { arguments, _, _ in
+                Response(status: 0,
+                         stdout: arguments == ["generate"] ? String(repeating: "x", count: 4 * 1024 * 1024) : "ok",
+                         stderr: "")
+            }
+            let finished = startDaemon(path: path, timeout: 3, clientTimeout: 0.1, recorder: recorder)
+            defer { cleanupDaemon(path: path) }
+            waitForSocket(path)
+
+            let stalled = try connectSocket(path: path)
+            defer { close(stalled) }
+            if stallsOutput {
+                try writeAll(stalled, data: JSONEncoder().encode(Request(arguments: ["generate"])))
+                shutdown(stalled, SHUT_WR)
+            } else {
+                try writeAll(stalled, data: Data("{".utf8))
+            }
+            let releaseClient = expectation(description: "release stalled client")
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) {
+                shutdown(stalled, SHUT_RDWR)
+                releaseClient.fulfill()
+            }
+            defer { wait(for: [releaseClient], timeout: 2) }
+
+            let start = Date()
+            XCTAssertEqual(try sendRequest(["status"], path: path, spawn: {}).stdout, "ok")
+            XCTAssertLessThan(Date().timeIntervalSince(start), 0.6)
+            _ = try sendRequest(["lock"], path: path, spawn: {})
+            wait(for: [finished], timeout: 2)
+        }
+    }
+
+    func testAuthorizationWindowStartsWhenAuthenticationCompletes() throws {
+        let path = temporarySocketPath()
+        var authorizationCount = 0
+        var credentialReads = 0
+        let finished = startDaemon(
+            path: path,
+            timeout: 0.2,
+            authenticator: {
+                authorizationCount += 1
+                usleep(300_000)
+            },
+            credentialReader: {
+                credentialReads += 1
+                if credentialReads == 1 { throw ToolError.message("Synthetic credential read failure") }
+                return Data("master".utf8)
+            },
+            recorder: lockedVaultRecorder()
+        )
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+
+        XCTAssertEqual(try sendRequest(["list", "items"], path: path, spawn: {}).status, 1)
+        XCTAssertEqual(try sendRequest(["list", "items"], path: path, spawn: {}).status, 0)
+        XCTAssertEqual(authorizationCount, 1)
+        _ = try sendRequest(["lock"], path: path, spawn: {})
+        wait(for: [finished], timeout: 2)
+    }
+
+    func testRequestCompletedAfterIdleExpiryRequiresNewAuthorization() throws {
+        let path = temporarySocketPath()
+        var authorizationCount = 0
+        let recorder = lockedVaultRecorder()
+        let finished = startDaemon(
+            path: path,
+            timeout: 0.2,
+            leaseDuration: 5,
+            authenticator: { authorizationCount += 1 },
+            recorder: recorder
+        )
+        defer { cleanupDaemon(path: path) }
+        waitForSocket(path)
+        _ = try sendRequest(["get", "item", itemID], path: path, spawn: {})
+
+        let client = try connectSocket(path: path)
+        defer { close(client) }
+        try writeAll(client, data: JSONEncoder().encode(Request(arguments: ["get", "item", otherItemID])))
+        usleep(450_000)
+        shutdown(client, SHUT_WR)
+        let response = try JSONDecoder().decode(Response.self, from: readAll(client))
+        XCTAssertEqual(response.status, 0)
+        XCTAssertEqual(authorizationCount, 2)
+
+        _ = try sendRequest(["lock"], path: path, spawn: {})
+        wait(for: [finished], timeout: 2)
+    }
+
     func testDaemonReusesAuthorizationAndReadsCredentialPerLockedCommand() throws {
         let path = temporarySocketPath()
         var authorizationCount = 0
@@ -653,6 +844,7 @@ private extension XCTestCase {
         path: String,
         timeout: TimeInterval,
         leaseDuration: TimeInterval = leaseTTL,
+        clientTimeout: TimeInterval = 5,
         authenticator: @escaping () throws -> Void = {},
         credentialReader: @escaping () throws -> Data = { Data("master".utf8) },
         recorder: InvocationRecorder
@@ -666,6 +858,7 @@ private extension XCTestCase {
                     lockFilePath: path + ".lock",
                     timeout: timeout,
                     leaseDuration: leaseDuration,
+                    clientTimeout: clientTimeout,
                     prepare: {},
                     authenticator: authenticator,
                     credentialReader: credentialReader,
