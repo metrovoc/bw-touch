@@ -1,3 +1,4 @@
+import AudioToolbox
 import Darwin
 import Foundation
 import LocalAuthentication
@@ -128,6 +129,7 @@ func authenticateWithTouchID() throws {
         authenticationError = error
         semaphore.signal()
     }
+    AudioServicesPlayAlertSoundWithCompletion(kSystemSoundID_UserPreferredAlert, nil)
     // An unanswered prompt would otherwise stall every request queued behind it.
     guard semaphore.wait(timeout: .now() + touchIDTimeout) == .success else {
         context.invalidate()
