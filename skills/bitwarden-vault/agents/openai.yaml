@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bitwarden Vault"
+  short_description: "Securely retrieve and use Bitwarden vault data"
+  default_prompt: "Use $bitwarden-vault to retrieve or use an item from my Bitwarden vault."
