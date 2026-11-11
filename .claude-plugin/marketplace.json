@@ -1,0 +1,11 @@
+{
+  "name": "bw-touch",
+  "owner": { "name": "metrovoc" },
+  "plugins": [
+    {
+      "name": "bw-touch",
+      "source": "./",
+      "description": "Read and inject Bitwarden vault secrets behind Touch ID, through the bw-touch bridge for the Bitwarden CLI on macOS."
+    }
+  ]
+}
