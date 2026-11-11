@@ -5,8 +5,7 @@ import LocalAuthentication
 import Security
 
 let service = "bitwarden.cli-master-password"
-let account = "user@example.com"
-let bwPath = "/opt/homebrew/bin/bw"
+let bwPath = locateBW()
 let ttl: TimeInterval = 15 * 60
 let leaseTTL: TimeInterval = 24 * 60 * 60
 let touchIDTimeout: TimeInterval = 60
@@ -78,12 +77,41 @@ func zeroize(_ data: inout Data) {
     data.removeAll(keepingCapacity: false)
 }
 
+func locateBW(
+    searchPath: String? = ProcessInfo.processInfo.environment["PATH"],
+    fallbackDirectories: [String] = ["/opt/homebrew/bin", "/usr/local/bin"]
+) -> String {
+    let directories = (searchPath ?? "").split(separator: ":").map(String.init) + fallbackDirectories
+    for directory in directories where directory.hasPrefix("/") {
+        let candidate = URL(fileURLWithPath: directory).appendingPathComponent("bw").path
+        if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+    }
+    return "bw"
+}
+
 func keychainBaseQuery() -> [String: Any] {
     [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
     ]
+}
+
+/// The Bitwarden account email recorded by `setup`, read without touching the stored password.
+func storedAccount() throws -> String {
+    var query = keychainBaseQuery()
+    query[kSecReturnAttributes as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status != errSecItemNotFound else {
+        throw ToolError.message("No stored credential. Run: bw-touch setup <email>")
+    }
+    guard status == errSecSuccess,
+          let attributes = result as? [String: Any],
+          let account = attributes[kSecAttrAccount as String] as? String, !account.isEmpty else {
+        throw ToolError.message("Unable to read the stored Bitwarden account: \(status)")
+    }
+    return account
 }
 
 func resolvedExecutablePath(_ executableURL: URL?) throws -> String {
@@ -140,16 +168,9 @@ func authenticateWithTouchID() throws {
     }
 }
 
-func setupCredential() throws {
-    var existing = keychainBaseQuery()
-    existing[kSecReturnAttributes as String] = true
-    var result: CFTypeRef?
-    let existingStatus = SecItemCopyMatching(existing as CFDictionary, &result)
-    if existingStatus == errSecSuccess {
-        throw ToolError.message("Credential already exists for \(account)")
-    }
-    guard existingStatus == errSecItemNotFound else {
-        throw ToolError.message("Keychain lookup failed: \(existingStatus)")
+func setupCredential(account: String) throws {
+    if let existing = try? storedAccount() {
+        throw ToolError.message("Credential already exists for \(existing)")
     }
 
     var first = try secureRead("Bitwarden master password: ")
@@ -163,6 +184,7 @@ func setupCredential() throws {
     }
 
     var item = keychainBaseQuery()
+    item[kSecAttrAccount as String] = account
     item[kSecValueData as String] = first
     item[kSecAttrLabel as String] = "Bitwarden CLI master password"
     item[kSecAttrDescription as String] = "Touch ID protected credential for bw-touch"
@@ -341,6 +363,7 @@ func executeCommand(
     _ arguments: [String],
     authorize: () throws -> Void,
     credentialReader: () throws -> Data = readCredential,
+    accountReader: () throws -> String = storedAccount,
     processRunner: ProcessRunner = {
         try runProcess(arguments: $0, extraEnvironment: $1, standardInput: $2)
     }
@@ -362,6 +385,7 @@ func executeCommand(
         let statusResponse = try processRunner(["status"], ["BW_NOINTERACTION": "true"], nil)
         if let status = try? parseVaultStatus(statusResponse), status.status == "unauthenticated" {
             try authorize()
+            let account = try accountReader()
             let login = try withCredential(from: credentialReader) {
                 try processRunner(["login", account, "--quiet"], [:], $0)
             }
@@ -550,6 +574,7 @@ func runDaemon(
     prepare: () throws -> Void = { try prepareRuntimeDirectory() },
     authenticator: () throws -> Void = authenticateWithTouchID,
     credentialReader: () throws -> Data = readCredential,
+    accountReader: () throws -> String = storedAccount,
     processRunner: ProcessRunner = {
         try runProcess(arguments: $0, extraEnvironment: $1, standardInput: $2)
     }
@@ -641,7 +666,7 @@ func runDaemon(
                 let operation = try PipedItemOperation(arguments: request.arguments, encodedInput: input)
                 try ensureAuthorized()
                 let response = try withCredential(from: credentialReader) {
-                    try executePipedItemOperation(operation, credential: $0,
+                    try executePipedItemOperation(operation, credential: $0, accountReader: accountReader,
                                                   processRunner: processRunner, payloadRunner: payloadRunner)
                 }
                 lastUsed = Date()
@@ -658,7 +683,7 @@ func runDaemon(
                 try writeAll(client, data: try JSONEncoder().encode(response))
             } else if request.arguments.first == "login" || request.arguments.first == "unlock" {
                 var arguments = request.arguments
-                if arguments == ["login"] { arguments.append(account) }
+                if arguments == ["login"] { arguments.append(try accountReader()) }
                 let response = try runWithCredential(arguments)
                 lastUsed = Date()
                 try writeAll(client, data: try JSONEncoder().encode(response))
@@ -669,6 +694,7 @@ func runDaemon(
                     request.arguments,
                     authorize: leased ? {} : ensureAuthorized,
                     credentialReader: credentialReader,
+                    accountReader: accountReader,
                     processRunner: processRunner
                 )
                 if authorized, response.status == 0, let itemID {
@@ -687,8 +713,12 @@ func runDaemon(
 
 public func runCLI(arguments: [String]) -> Int32 {
     do {
-        if arguments == ["setup"] {
-            try setupCredential()
+        if arguments.first == "setup" {
+            guard arguments.count == 2, arguments[1].contains("@") else {
+                FileHandle.standardError.write(Data("Usage: bw-touch setup <email>\n".utf8))
+                return 2
+            }
+            try setupCredential(account: arguments[1])
             return 0
         }
         if arguments == ["--self-test-keychain"] {
@@ -700,8 +730,11 @@ public func runCLI(arguments: [String]) -> Int32 {
             return 0
         }
         if arguments.isEmpty {
-            FileHandle.standardError.write(Data("Usage: bw-touch setup | bw-touch <bw arguments>\n".utf8))
+            FileHandle.standardError.write(Data("Usage: bw-touch setup <email> | bw-touch <bw arguments>\n".utf8))
             return 2
+        }
+        guard FileManager.default.isExecutableFile(atPath: bwPath) else {
+            throw ToolError.message("Bitwarden CLI (bw) was not found on PATH")
         }
         let input = try commandInput(arguments: arguments, isTerminal: isatty(STDIN_FILENO) == 1) {
             FileHandle.standardInput.readData(ofLength: 64 * 1024)

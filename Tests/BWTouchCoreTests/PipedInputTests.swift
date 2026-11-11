@@ -104,7 +104,7 @@ final class PipedInputTests: XCTestCase {
         let credential = Data("synthetic-master".utf8)
         var calls: [[String]] = []
         let expected = Response(status: 0, stdout: "created", stderr: "")
-        let result = try executePipedItemOperation(operation, credential: credential,
+        let result = try executePipedItemOperation(operation, credential: credential, accountReader: { account },
                                                   processRunner: { arguments, environment, input in
             calls.append(arguments)
             if arguments == ["status"] {
@@ -132,6 +132,7 @@ final class PipedInputTests: XCTestCase {
                                                encodedInput: Data(item.base64EncodedString().utf8))
         var calls: [[String]] = []
         let result = try executePipedItemOperation(operation, credential: Data("synthetic-master".utf8),
+                                                  accountReader: { account },
                                                   processRunner: { arguments, _, _ in
             calls.append(arguments)
             if arguments == ["status"] {
@@ -277,3 +278,5 @@ time.sleep(30)
                                         timeout: timeout)
     }
 }
+
+private let account = "user@example.com"

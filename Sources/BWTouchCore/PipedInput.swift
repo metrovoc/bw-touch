@@ -195,12 +195,13 @@ func successfulPayloadObject(_ response: PayloadHTTPResponse) throws -> [String:
 func executePipedItemOperation(
     _ operation: PipedItemOperation,
     credential: Data,
+    accountReader: () throws -> String = storedAccount,
     processRunner: ProcessRunner,
     payloadRunner: (PipedItemOperation, Data) throws -> Response
 ) throws -> Response {
     let status = try parseVaultStatus(processRunner(["status"], ["BW_NOINTERACTION": "true"], nil))
     if status.status == "unauthenticated" {
-        let login = try processRunner(["login", account, "--quiet"], [:], credential)
+        let login = try processRunner(["login", try accountReader(), "--quiet"], [:], credential)
         guard login.status == 0 else { return removingPasswordPrompt(from: login) }
     }
     return try payloadRunner(operation, credential)

@@ -112,6 +112,7 @@ final class CommandExecutionTests: XCTestCase {
                 credentialReadCount += 1
                 return Data("master".utf8)
             },
+            accountReader: { account },
             processRunner: { arguments, environment, input in
                 calls.append(Invocation(arguments: arguments, environment: environment, standardInput: input))
                 switch arguments {
@@ -146,6 +147,7 @@ final class CommandExecutionTests: XCTestCase {
             ["list", "items"],
             authorize: {},
             credentialReader: { Data("master".utf8) },
+            accountReader: { account },
             processRunner: { arguments, _, _ in
                 commands.append(arguments)
                 if arguments == ["status"] {
@@ -775,6 +777,32 @@ final class KeychainIntegrationTests: XCTestCase {
     }
 }
 
+final class BWLocationTests: XCTestCase {
+    func testLocatesBWOnSearchPathBeforeFallbacks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let onPath = root.appendingPathComponent("path")
+        let fallback = root.appendingPathComponent("fallback")
+        for directory in [onPath, fallback] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let binary = directory.appendingPathComponent("bw")
+            FileManager.default.createFile(atPath: binary.path, contents: Data(),
+                                           attributes: [.posixPermissions: 0o755])
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertEqual(
+            locateBW(searchPath: "relative:\(root.path)/missing:\(onPath.path)", fallbackDirectories: [fallback.path]),
+            onPath.appendingPathComponent("bw").path
+        )
+        XCTAssertEqual(
+            locateBW(searchPath: nil, fallbackDirectories: [fallback.path]),
+            fallback.appendingPathComponent("bw").path
+        )
+        XCTAssertEqual(locateBW(searchPath: "\(root.path)/missing", fallbackDirectories: []), "bw")
+    }
+}
+
+private let account = "user@example.com"
 private let itemID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 private let otherItemID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
 
